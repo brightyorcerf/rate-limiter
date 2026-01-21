@@ -1,5 +1,5 @@
 # 🛡️ api rate limiter 
-![ratelimiter](hehe.jpg)
+<img src="hehe.jpg" width="200" height="auto">
 
 > **Production-grade distributed API rate limiter that doesn't suck.**
 

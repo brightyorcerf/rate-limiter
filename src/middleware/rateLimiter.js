@@ -73,10 +73,16 @@ function createRateLimiter(options = {}) {
 
     // Add rate limit headers (standard headers that clients can use)
     if (config.headers) {
-      res.setHeader('X-RateLimit-Limit', result.limit);
-      res.setHeader('X-RateLimit-Remaining', result.remaining);
-      res.setHeader('X-RateLimit-Reset', new Date(result.resetTime).toISOString());
-      
+      // Add safety checks
+      if (result.limit !== undefined) {
+        res.setHeader('X-RateLimit-Limit', result.limit);
+      }
+      if (result.remaining !== undefined) {
+        res.setHeader('X-RateLimit-Remaining', result.remaining);
+      }
+      if (result.resetTime) {
+        res.setHeader('X-RateLimit-Reset', new Date(result.resetTime).toISOString());
+      }
       if (!result.allowed) {
         // Tell client when to retry (in seconds)
         res.setHeader('Retry-After', Math.ceil(result.retryAfter / 1000));
