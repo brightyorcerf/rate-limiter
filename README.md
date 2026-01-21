@@ -10,19 +10,12 @@
 ### Node.js + Express
 Rate limiting is I/O bound, not CPU bound. Node's event loop handles concurrent requests beautifully, and Express middleware makes integration simple. Rust or Go would have been an overkill.
 
-### Redis*
+### Redis
 - Atomic operations via Lua scripts (no race conditions)
 - Sub-millisecond latency (your API stays fast)
 - Built-in TTL (auto-cleanup, no memory leaks)
 
-I tried PostgreSQL first. Bad idea. The latency was noticeable even at moderate load.  
-
-### Token Bucket Algorithm 
-- Allows burst traffic (real users don't request at perfect intervals) 
-- Efficient (just two numbers to track per client)
-
-Sliding window is more "fair" but way more complex. 
-Leaky bucket is smoother but punishes legitimate bursts.  
+Tried PostgreSQL first, the latency was noticeable even at moderate load.  
 
 ---
 
@@ -185,12 +178,12 @@ app.use(rateLimiter({
 
 ## Testing
 
-### run Algorithm Tests
+### run algorithm tests
 ```bash
 node tests/tokenBucket.test.js
 ```
 
-### load Testing
+### load testing
 ```bash
 # install Apache Bench
 brew install httpd  # Mac
@@ -205,7 +198,7 @@ ab -n 500 -c 10 http://localhost:3001/api/expensive &
 
 ---
 
-## admin Endpoints (Redis Only)
+## admin endpoints (redis only)
 
 ```bash
 # view statistics
@@ -217,45 +210,10 @@ curl http://localhost:3000/api/admin/bucket/192.168.1.1
 # reset client's rate limit
 curl -X POST http://localhost:3000/api/admin/reset/192.168.1.1
 ```
+--- 
 
----
+## This project taught me:
 
-## Project Structure
-
-```
-ratelimiter/
-├── src/
-│   ├── algorithms/
-│   │   └── tokenBucket.js       # Core algorithm (100 lines)
-│   ├── middleware/
-│   │   └── rateLimiter.js       # Express middleware (150 lines)
-│   ├── storage/
-│   │   ├── memoryStore.js       # Single-server storage (100 lines)
-│   │   └── redisStore.js        # Multi-server storage (200 lines)
-│   └── demo/
-│       ├── server.js            # In-memory demo
-│       └── server-redis.js      # Redis demo
-└── tests/
-    └── tokenBucket.test.js      # Algorithm tests
-``` 
----
-
-## When to Use This
-
-### Perfect For:
-- Multi-server deployments  
-- APIs with burst traffic (token bucket handles this elegantly)
-- Simple, understandable rate limiting  
-- Learning distributed systems  
-
-### Not Great For:
-- Single-server apps with low traffic (just use `express-rate-limit`)
-- Complex tiered pricing (need something like Kong or AWS API Gateway)
-- Real-time updates (this is rate limiting, not a message queue)
-
----   
-
-This project taught me:
 - Redis Lua scripts are criminally underused
 - Simple algorithms beat complex ones  
 - Good developer experience matters (easy config, clear errors)
