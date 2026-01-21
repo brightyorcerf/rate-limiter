@@ -1,0 +1,8 @@
+# Test rate limiting (same as before)
+for i in {1..10}; do curl http://localhost:3000/api/expensive; echo ""; done
+
+# NEW: Check Redis stats
+curl http://localhost:3000/api/admin/stats
+
+# NEW: View your bucket state in Redis
+curl http://localhost:3000/api/admin/bucket/::1
