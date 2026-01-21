@@ -1,0 +1,8 @@
+# 1. Hit the expensive endpoint 10 times rapidly
+for i in {1..10}; do curl http://localhost:3000/api/expensive; echo ""; done
+
+# 2. Check the headers
+curl -i http://localhost:3000/api/expensive
+
+# 3. Test with API key
+curl -H "X-Api-Key: testkey" http://localhost:3000/api/with-key

@@ -1,38 +1,31 @@
 /**
- * Memory Store for Rate Limiter
+ * memory Store for Rate Limiter
  * 
- * Stores TokenBucket instances for each client (identified by IP, API key, etc.)
- * This is the in-memory version - great for single-server deployments
+ * stores TokenBucket instances for each client  
+ * this is the in-memory version, great for single-server deployments
  * 
- * In production with multiple servers, you'd use Redis instead
+ * in production with multiple servers, we'ld use Redis instead
  */
 
 const TokenBucket = require('../algorithms/tokenBucket');
 
-class MemoryStore {
-  constructor() {
-    // Map of identifier -> TokenBucket instance
-    // e.g., { '192.168.1.1': TokenBucket, 'api_key_123': TokenBucket }
+class MemoryStore{
+  constructor(){ 
     this.buckets = new Map();
-    
-    // Cleanup old buckets periodically to prevent memory leaks
     this.startCleanup();
   }
 
   /**
-   * Get or create a bucket for a client
-   * @param {string} identifier - Client identifier (IP, API key, etc.)
-   * @param {number} capacity - Bucket capacity
-   * @param {number} refillRate - Tokens per second
-   * @returns {TokenBucket} - The bucket for this client
+   * get or create a bucket for a client
+   * @param {string} identifier - client identifier  
+   * @param {number} capacity - bucket capacity
+   * @param {number} refillRate - tokens/s
+   * @returns {TokenBucket} - the bucket for this client
    */
-  getBucket(identifier, capacity, refillRate) {
-    // If bucket exists, return it
+  getBucket(identifier, capacity, refillRate) { 
     if (this.buckets.has(identifier)) {
       return this.buckets.get(identifier);
     }
-    
-    // Create new bucket for this client
     const bucket = new TokenBucket(capacity, refillRate);
     this.buckets.set(identifier, bucket);
     

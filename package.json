@@ -1,19 +1,21 @@
 {
-  "name": "ratelimiter",
+  "name": "rateguard",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Production-ready API rate limiter with token bucket algorithm",
+  "main": "src/demo/server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/demo/server.js",
+    "dev": "nodemon src/demo/server.js",
+    "test": "node tests/tokenBucket.test.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": ["rate-limiter", "middleware", "express", "token-bucket"],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
-    "express": "^5.2.1",
-    "redis": "^5.10.0"
+    "express": "^4.18.2",
+    "redis": "^4.6.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.11"
+    "nodemon": "^3.0.2"
   }
 }
