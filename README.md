@@ -1,6 +1,5 @@
-
-![image.jpg](image.jpg)
 Production-grade distributed API rate limiter.
+![image.jpg](image.jpg)
 
 ---       
 ## Tech Stack  
