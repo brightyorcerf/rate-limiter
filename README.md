@@ -176,37 +176,22 @@ app.use(rateLimiter({
 
 ## Testing
 
-### run algorithm tests
-```bash
-node tests/tokenBucket.test.js
-```
-
-### load testing
-```bash
-# install Apache Bench
-brew install httpd  # Mac
-
-# test single server
-ab -n 1000 -c 10 http://localhost:3000/api/expensive
-
-# test distributed (run 2 servers first)
-ab -n 500 -c 10 http://localhost:3000/api/expensive &
-ab -n 500 -c 10 http://localhost:3001/api/expensive &
-```
+See [test.txt](test.txt) for complete test suite including distributed multi-server tests. 
 
 ---
 
 ## admin endpoints (redis only)
 
+monitor and manage rate limits:
 ```bash
-# view statistics
+# View statistics
 curl http://localhost:3000/api/admin/stats
 
-# check specific client's bucket
-curl http://localhost:3000/api/admin/bucket/192.168.1.1
-
-# reset client's rate limit
+# Reset a client
 curl -X POST http://localhost:3000/api/admin/reset/192.168.1.1
+```
+
+full API documentation in the redis server source.
 ```
 --- 
 
@@ -216,8 +201,8 @@ curl -X POST http://localhost:3000/api/admin/reset/192.168.1.1
 - Simple algorithms beat complex ones  
 - Good developer experience matters (easy config, clear errors)
 
-If you're interviewing for backend roles, build this. Then talk about:
+Points to talk about:
 - Distributed systems (multi-server coordination)
 - Race conditions (and how Lua scripts prevent them)
-- Performance tradeoffs (Redis vs Postgres vs in-memory)
+- Performance tra deoffs (Redis vs Postgres vs in-memory)
 - Production concerns (cleanup, monitoring, graceful degradation)
