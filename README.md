@@ -1,8 +1,8 @@
-# 🛡️ Rate Limiter
+
 ![image.jpg](image.jpg)
 Production-grade distributed API rate limiter.
 
----
+---       
 ## Tech Stack  
 
 ### Node.js + Express

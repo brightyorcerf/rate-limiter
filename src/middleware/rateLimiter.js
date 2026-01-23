@@ -64,16 +64,15 @@ function createRateLimiter(options = {}) {
       return next();
     }
 
-    // Check rate limit
-    const result = config.store.checkLimit(clientId, {
+    // Check rate limit (MUST await for Redis!)
+    const result = await config.store.checkLimit(clientId, {
       capacity: config.capacity,
       refillRate: refillRate,
       tokens: 1
     });
 
     // Add rate limit headers (standard headers that clients can use)
-    if (config.headers) {
-      // Add safety checks
+    if (config.headers && result) {
       if (result.limit !== undefined) {
         res.setHeader('X-RateLimit-Limit', result.limit);
       }
@@ -83,7 +82,8 @@ function createRateLimiter(options = {}) {
       if (result.resetTime) {
         res.setHeader('X-RateLimit-Reset', new Date(result.resetTime).toISOString());
       }
-      if (!result.allowed) {
+      
+      if (!result.allowed && result.retryAfter) {
         // Tell client when to retry (in seconds)
         res.setHeader('Retry-After', Math.ceil(result.retryAfter / 1000));
       }
