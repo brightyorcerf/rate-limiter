@@ -1,7 +1,11 @@
-Production-grade distributed API rate limiter.
-![image.jpg](image.jpg)
+# API Rate Limiter
 
----       
+Production-grade distributed rate limiting with Redis.
+
+![image](image.jpg)
+
+---
+
 ## Tech Stack  
 
 ### Node.js + Express
