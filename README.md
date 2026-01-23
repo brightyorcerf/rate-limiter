@@ -176,7 +176,7 @@ app.use(rateLimiter({
 
 ## Testing
 
-See [test.txt](test.txt) for complete test suite including distributed multi-server tests. 
+See [test.txt](tests/checks.txt) for complete test suite including distributed multi-server tests. 
 
 ---
 
