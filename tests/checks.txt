@@ -1,8 +1,387 @@
-# 1. Hit the expensive endpoint 10 times rapidly
+# Complete Testing Suite
+# This file contains all tests to verify your rate limiter works correctly  
+
+# ============================================================================
+# PART 1: SETUP & PREREQUISITES
+# ============================================================================
+
+# 1.1 - Check if Redis is installed
+redis-cli --version 
+
+# 1.2 - Check if Redis is running
+redis-cli ping
+# Expected: PONG 
+
+# 1.4 - Verify Node.js installation
+node --version
+# Expected: v16+ or higher
+
+# ============================================================================
+# PART 2: IN-MEMORY SERVER TESTS (Single Server)
+# ============================================================================
+
+# 2.1 - Start in-memory server (run in separate terminal)
+node src/demo/server.js
+# Expected: Server running on http://localhost:3000
+
+# --- wait for server to start ---
+
+# 2.2 - Test basic connectivity
+curl http://localhost:3000/
+# Expected: Welcome message with endpoints list
+
+# 2.3 - Test strict rate limit (5 req/min)
+for i in {1..10}; do curl http://localhost:3000/api/expensive; echo ""; done
+# Expected: First 5 succeed, next 5 get 429 errors
+
+# 2.4 - Check rate limit headers
+curl -i http://localhost:3000/api/expensive
+# Expected: X-RateLimit-Limit: 5, X-RateLimit-Remaining: 0-5, Retry-After: X
+
+# 2.5 - Test relaxed endpoint (120 req/min)
+for i in {1..10}; do curl http://localhost:3000/api/public; echo ""; done
+# Expected: All 10 should succeed
+
+# 2.6 - Test API key-based rate limiting
+curl -H "X-Api-Key: user1" http://localhost:3000/api/with-key
+curl -H "X-Api-Key: user2" http://localhost:3000/api/with-key
+# Expected: Different API keys get separate rate limits
+
+# 2.7 - Test same API key rate limit
+for i in {1..12}; do curl -H "X-Api-Key: testkey" http://localhost:3000/api/with-key; echo ""; done
+# Expected: First 10 succeed (10 req/min limit), last 2 fail
+
+# 2.8 - Test admin bypass (whitelisted)
+for i in {1..15}; do curl -H "X-Admin-Token: supersecret" http://localhost:3000/api/admin; echo ""; done
+# Expected: All succeed (no rate limit for admin token)
+
+# 2.9 - Test login protection (3 req/min)
+for i in {1..5}; do curl -X POST http://localhost:3000/api/login; echo ""; done
+# Expected: First 3 succeed, last 2 get custom 429 message
+
+# 2.10 - Test token refill (wait and retry)
+# First exhaust the limit
+for i in {1..5}; do curl http://localhost:3000/api/expensive; done
+# Then wait 12 seconds and try again
+sleep 12
+curl http://localhost:3000/api/expensive
+# Expected: Should succeed after waiting (token refilled)
+
+# 2.11 - Check status endpoint
+curl http://localhost:3000/api/status
+# Expected: JSON with all endpoints and rate limits
+
+# ============================================================================
+# PART 3: REDIS SERVER TESTS (Distributed)
+# ============================================================================
+
+# 3.1 - Clear Redis (fresh start)
+redis-cli FLUSHALL
+# Expected: OK
+
+# 3.2 - Start Redis server (run in separate terminal)
+node src/demo/server-redis.js 
+
+# --- wait for server to start ---
+
+# 3.3 - Test basic Redis connectivity
+curl http://localhost:3000/
+# Expected: Welcome message mentioning Redis backend
+
+# 3.4 - Test Redis rate limiting
+for i in {1..10}; do curl http://localhost:3000/api/expensive; echo ""; done
+# Expected: First 5 succeed, next 5 get 429 with Redis message
+
+# 3.5 - Check Redis statistics
+curl http://localhost:3000/api/admin/stats
+# Expected: {"totalClients": 1, "clients": ["::1"]}
+
+# 3.6 - View bucket state in Redis
+curl http://localhost:3000/api/admin/bucket/::1
+# Expected: Shows tokens, lastRefill, key info
+
+# 3.7 - Reset rate limit for client
+curl -X POST http://localhost:3000/api/admin/reset/::1
+# Expected: Success message
+
+# 3.8 - Verify reset worked
+curl http://localhost:3000/api/expensive
+# Expected: Should succeed (limit was reset)
+
+# 3.9 - Check Redis keys directly
+redis-cli KEYS "ratelimit:*"
+# Expected: List of rate limit keys
+
+# 3.10 - Inspect Redis data
+redis-cli HGETALL "ratelimit:::1"
+# Expected: Shows tokens and last_refill values
+
+# ============================================================================
+# PART 4: DISTRIBUTED MULTI-SERVER TESTS (THE COOL PART!)
+# ============================================================================
+
+# 4.1 - Clear Redis
+redis-cli FLUSHALL
+
+# 4.2 - Start Redis (Terminal 1)
+redis-server
+
+# 4.3 - Start Server 1 (Terminal 2)
+PORT=3000 SERVER_ID=server1 node src/demo/server-redis.js
+
+# 4.4 - Start Server 2 (Terminal 3)
+PORT=3001 SERVER_ID=server2 node src/demo/server-redis.js
+
+# --- run these tests in terminal 4 ---
+
+# 4.5 - Verify both servers are running
+curl http://localhost:3000/ | grep server1
+curl http://localhost:3001/ | grep server2
+# Expected: Both return responses
+
+# 4.6 - Test distributed rate limiting (sequential)
+curl http://localhost:3000/api/expensive
+curl http://localhost:3000/api/expensive
+curl http://localhost:3000/api/expensive
+curl http://localhost:3001/api/expensive
+curl http://localhost:3001/api/expensive
+curl http://localhost:3001/api/expensive
+# Expected: 5 succeed across BOTH servers, 6th fails
+
+# 4.7 - Test distributed rate limiting (parallel - THE BIG TEST!)
+(for i in {1..3}; do curl http://localhost:3000/api/expensive & done; \
+ for i in {1..3}; do curl http://localhost:3001/api/expensive & done; \
+ wait)
+# Expected: 5 succeed across both servers, 1 fails
+# This PROVES distributed rate limiting works!
+
+# 4.8 - Verify shared Redis state
+curl http://localhost:3000/api/admin/stats
+curl http://localhost:3001/api/admin/stats
+# Expected: Same stats from both servers (same Redis!)
+
+# 4.9 - Reset from one server, check on other
+curl -X POST http://localhost:3000/api/admin/reset/::1
+curl http://localhost:3001/api/expensive
+# Expected: Should succeed (reset worked across servers)
+
+# 4.10 - Load test across servers
+for i in {1..50}; do 
+  curl http://localhost:3000/api/public &
+  curl http://localhost:3001/api/public &
+done
+wait
+# Expected: Should handle all requests (120 req/min limit)
+
+# ============================================================================
+# PART 5: ALGORITHM VERIFICATION TESTS
+# ============================================================================
+
+# 5.1 - Run token bucket unit tests
+node tests/tokenBucket.test.js
+# Expected: All tests pass, shows token refill working
+
+# 5.2 - Test burst traffic (token bucket allows this)
+for i in {1..5}; do curl http://localhost:3000/api/expensive & done; wait
+# Expected: All 5 succeed instantly (burst allowed)
+
+# 5.3 - Test steady state (after burst)
+for i in {1..5}; do curl http://localhost:3000/api/expensive; sleep 1; done
+# Expected: Fail initially, succeed as tokens refill
+
+# 5.4 - Verify refill rate calculation
+# With 5 tokens/min = 1 token per 12 seconds
+curl http://localhost:3000/api/expensive  # Use token 1
+sleep 12
+curl http://localhost:3000/api/expensive  # Should succeed (1 token refilled)
+# Expected: Second request succeeds
+
+# ============================================================================
+# PART 6: EDGE CASES & ERROR HANDLING
+# ============================================================================
+
+# 6.1 - Test with no identifier (should use IP)
+curl http://localhost:3000/api/expensive
+# Expected: Should work, uses IP address
+
+# 6.2 - Test with empty API key
+curl -H "X-Api-Key: " http://localhost:3000/api/with-key
+# Expected: Falls back to IP address
+
+# 6.3 - Test invalid endpoint
+curl http://localhost:3000/api/nonexistent
+# Expected: 404 Not Found
+
+# 6.4 - Test Redis connection failure (stop Redis, then test)
+# Stop redis-server with Ctrl+C, then:
+curl http://localhost:3000/api/expensive
+# Expected: Should fail open (allow request) with error logged
+
+# 6.5 - Test concurrent requests (race condition check)
+for i in {1..20}; do curl http://localhost:3000/api/expensive & done; wait
+# Expected: Exactly 5 succeed, 15 fail (no leaks!)
+
+# 6.6 - Test POST vs GET (different methods)
+curl -X POST http://localhost:3000/api/expensive
+curl -X GET http://localhost:3000/api/expensive
+# Expected: Both count toward same rate limit
+
+# 6.7 - Test very long identifier
+curl -H "X-Api-Key: $(python3 -c 'print("a"*1000)')" http://localhost:3000/api/with-key
+# Expected: Should handle gracefully
+
+# ============================================================================
+# PART 7: PERFORMANCE & LOAD TESTS
+# ============================================================================
+
+# 7.1 - Install Apache Bench (if not installed)
+# Mac: brew install httpd
+# Linux: sudo apt-get install apache2-utils
+
+# 7.2 - Basic load test (single endpoint)
+ab -n 100 -c 10 http://localhost:3000/api/expensive
+# Expected: ~5 succeed, ~95 fail, check requests/sec
+
+# 7.3 - Load test with high limits
+ab -n 1000 -c 50 http://localhost:3000/api/public
+# Expected: Most succeed (120 req/min limit)
+
+# 7.4 - Distributed load test
+ab -n 500 -c 25 http://localhost:3000/api/expensive &
+ab -n 500 -c 25 http://localhost:3001/api/expensive &
+wait
+# Expected: ~5 total succeed across both servers
+
+# 7.5 - Measure latency with rate limiter
+time curl http://localhost:3000/api/expensive
+# Expected: < 50ms (very fast!)
+
+# ============================================================================
+# PART 8: MONITORING & DEBUGGING
+# ============================================================================
+
+# 8.1 - Monitor Redis in real-time
+redis-cli MONITOR
+# Then make requests and watch Redis commands execute
+
+# 8.2 - Check Redis memory usage
+redis-cli INFO memory
+# Expected: Shows memory stats
+
+# 8.3 - Check all rate limit keys
+redis-cli KEYS "ratelimit:*"
+# Expected: List of all active buckets
+
+# 8.4 - Check specific bucket details
+redis-cli HGETALL "ratelimit:::1"
+# Expected: tokens and last_refill values
+
+# 8.5 - Check server logs
+# Look at the terminal running the server for request logs
+# Expected: See timestamp, method, path, IP for each request
+
+# 8.6 - Test cleanup (inactive buckets removed after 1 hour)
+# This would require waiting 1 hour, but you can check code works:
+# Check src/storage/memoryStore.js startCleanup() function
+
+# ============================================================================
+# PART 9: INTEGRATION TESTS
+# ============================================================================
+
+# 9.1 - Full workflow test
+curl http://localhost:3000/api/status  # Check status
+for i in {1..5}; do curl http://localhost:3000/api/expensive; done  # Use limit
+curl http://localhost:3000/api/admin/stats  # Check stats
+curl -X POST http://localhost:3000/api/admin/reset/::1  # Reset
+curl http://localhost:3000/api/expensive  # Should work
+# Expected: All steps succeed in order
+
+# 9.2 - API key workflow
+curl -H "X-Api-Key: customer1" http://localhost:3000/api/with-key  # First request
+for i in {1..12}; do curl -H "X-Api-Key: customer1" http://localhost:3000/api/with-key; done  # Exhaust
+curl http://localhost:3000/api/admin/stats  # Check tracked
+curl -X POST http://localhost:3000/api/admin/reset/customer1  # Reset specific key
+curl -H "X-Api-Key: customer1" http://localhost:3000/api/with-key  # Should work
+# Expected: Complete customer management flow
+
+# ============================================================================
+# PART 10: CLEANUP & VERIFICATION
+# ============================================================================
+
+# 10.1 - Clear all Redis data
+redis-cli FLUSHALL
+# Expected: OK
+
+# 10.2 - Verify Redis is empty
+redis-cli DBSIZE
+# Expected: (integer) 0
+
+# 10.3 - Stop all servers
+# Ctrl+C in each terminal running a server
+
+# 10.4 - Stop Redis
+# Ctrl+C in terminal running redis-server
+
+# 10.5 - Verify nothing is running
+lsof -i :3000
+lsof -i :3001
+lsof -i :6379
+# Expected: No output (all ports free)
+
+# ============================================================================
+# SUCCESS CRITERIA 
+#
+# ✅ All in-memory tests pass
+# ✅ All Redis tests pass
+# ✅ Multi-server distributed tests pass (MOST IMPORTANT!)
+# ✅ Exactly 5 requests succeed in parallel test
+# ✅ Headers show correct rate limit info
+# ✅ Admin endpoints work
+# ✅ Token refill works correctly
+# ✅ No race conditions (atomic operations)
+# ✅ Performance is good (< 50ms latency)
+# ✅ Error handling works (graceful degradation)
+# 
+
+# ============================================================================
+# QUICK TEST CHECKLIST (Run these for fast verification)
+# ============================================================================
+
+# ☐ In-memory basic test
+node src/demo/server.js
 for i in {1..10}; do curl http://localhost:3000/api/expensive; echo ""; done
 
-# 2. Check the headers
+# ☐ Redis basic test
+node src/demo/server-redis.js
+for i in {1..10}; do curl http://localhost:3000/api/expensive; echo ""; done
+
+# ☐ Distributed test 
+PORT=3000 SERVER_ID=server1 node src/demo/server-redis.js  # Terminal 2
+PORT=3001 SERVER_ID=server2 node src/demo/server-redis.js  # Terminal 3
+(for i in {1..3}; do curl http://localhost:3000/api/expensive & done; \
+ for i in {1..3}; do curl http://localhost:3001/api/expensive & done; \
+ wait)  # Terminal 4
+
+# ☐ Admin stats
+curl http://localhost:3000/api/admin/stats
+
+# ☐ Algorithm test
+node tests/tokenBucket.test.js
+
+# ============================================================================
+# Best commands to screenshot for your portfolio:
+# ============================================================================
+
+# 1. Distributed rate limiting proof
+(for i in {1..3}; do curl http://localhost:3000/api/expensive & done; \
+ for i in {1..3}; do curl http://localhost:3001/api/expensive & done; \
+ wait)
+
+# 2. Rate limit headers
 curl -i http://localhost:3000/api/expensive
 
-# 3. Test with API key
-curl -H "X-Api-Key: testkey" http://localhost:3000/api/with-key
+# 3. Redis statistics
+curl http://localhost:3000/api/admin/stats
+
+# 4. Load test results
+ab -n 100 -c 10 http://localhost:3000/api/expensive
