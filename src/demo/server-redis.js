@@ -40,11 +40,6 @@ app.use((req, res, next) => {
 /**
  * Route 1: Global rate limit with Redis
  */
-app.use(rateLimiter({
-  requestsPerMinute: 60,
-  store: redisStore, // <-- Redis store!
-  message: 'Global rate limit exceeded (backed by Redis)'
-}));
 
 /**
  * Route 2: Strict endpoint with Redis
@@ -219,6 +214,12 @@ app.get('/', (req, res) => {
     }
   });
 });
+
+app.use(rateLimiter({
+  requestsPerMinute: 60,
+  store: redisStore, // <-- Redis store!
+  message: 'Global rate limit exceeded (backed by Redis)'
+}));
 
 // Error handling
 app.use((err, req, res, next) => {
