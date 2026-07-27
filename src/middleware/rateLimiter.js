@@ -1,145 +1,250 @@
-/**
- * Rate Limiter Express Middleware
- * 
- * Usage:
- *   const rateLimiter = require('./middleware/rateLimiter');
- *   app.use(rateLimiter({ requestsPerMinute: 10 }));
- * 
- * Or per-route:
- *   app.get('/api/expensive', rateLimiter({ requestsPerMinute: 5 }), handler);
- */
+'use strict';
 
 const MemoryStore = require('../storage/memoryStore');
+const { assertNumber, assertFunction, assertStore } = require('../internal/validate');
+const { normalizeIdentifier, normalizeScope, scopeFor } = require('../internal/identity');
 
 /**
- * Create rate limiter middleware
- * @param {object} options - Configuration options
- * @returns {function} - Express middleware function
+ * Express rate limiting middleware.
+ *
+ *   const rateLimiter = require('./middleware/rateLimiter');
+ *   app.use(rateLimiter({ requestsPerMinute: 60 }));
+ *   app.post('/api/expensive', rateLimiter({ requestsPerMinute: 5, scope: 'expensive' }), handler);
+ *
+ * Ordering matters: middleware only protects what is registered after it.
+ * A limiter mounted below the routes runs on 404s and nothing else.
+ *
+ * Composition matters too: a request passing through two limiters spends a
+ * token in each, so the effective limit is the strictest one on the path.
  */
-function createRateLimiter(options = {}) {
-  // Default configuration
-  const config = {
-    // Rate limit: 60 requests per minute by default
-    requestsPerMinute: options.requestsPerMinute || 60,
-    
-    // Allow burst traffic (capacity = requests per minute)
-    capacity: options.capacity || options.requestsPerMinute || 60,
-    
-    // Custom identifier function (default: use IP address)
-    identifier: options.identifier || ((req) => req.ip || req.connection.remoteAddress),
-    
-    // Custom storage (default: in-memory)
-    store: options.store || new MemoryStore(),
-    
-    // Skip rate limiting for certain requests
-    skip: options.skip || (() => false),
-    
-    // Custom handler when rate limit exceeded
-    handler: options.handler || null,
-    
-    // Include rate limit headers in response
-    headers: options.headers !== false, // Default true
-    
-    // Message when rate limited
-    message: options.message || 'Too many requests, please try again later.'
-  };
 
-  // Calculate refill rate (tokens per second)
-  const refillRate = config.requestsPerMinute / 60;
+// One shared store for every limiter that does not bring its own. Buckets are
+// namespaced by scope, so sharing is safe - and it means N limiters cost one
+// cleanup timer instead of N.
+let sharedMemoryStore = null;
 
-  /**
-   * The actual middleware function
-   */
-  return async function rateLimiterMiddleware(req, res, next) {
-    // Check if we should skip this request
-    if (config.skip(req)) {
-      return next();
-    }
-
-    // Get client identifier (IP address, API key, etc.)
-    const clientId = config.identifier(req);
-
-    if (!clientId) {
-      console.warn('[RateLimiter] No identifier found for request');
-      return next();
-    }
-
-    // Check rate limit (MUST await for Redis!)
-    const result = await config.store.checkLimit(clientId, {
-      capacity: config.capacity,
-      refillRate: refillRate,
-      tokens: 1
-    });
-
-    // Add rate limit headers (standard headers that clients can use)
-    if (config.headers && result) {
-      if (result.limit !== undefined) {
-        res.setHeader('X-RateLimit-Limit', result.limit);
-      }
-      if (result.remaining !== undefined) {
-        res.setHeader('X-RateLimit-Remaining', result.remaining);
-      }
-      if (result.resetTime) {
-        res.setHeader('X-RateLimit-Reset', new Date(result.resetTime).toISOString());
-      }
-      
-      if (!result.allowed && result.retryAfter) {
-        // Tell client when to retry (in seconds)
-        res.setHeader('Retry-After', Math.ceil(result.retryAfter / 1000));
-      }
-    }
-
-    // If allowed, continue to next middleware
-    if (result.allowed) {
-      return next();
-    }
-
-    // Rate limit exceeded - handle rejection
-    if (config.handler) {
-      // Use custom handler if provided
-      return config.handler(req, res, next);
-    }
-
-    // Default: return 429 Too Many Requests
-    return res.status(429).json({
-      error: 'Too Many Requests',
-      message: config.message,
-      retryAfter: Math.ceil(result.retryAfter / 1000), // Seconds
-      limit: result.limit,
-      remaining: 0
-    });
-  };
+function getSharedMemoryStore() {
+  if (!sharedMemoryStore) sharedMemoryStore = new MemoryStore();
+  return sharedMemoryStore;
 }
 
 /**
- * Preset configurations for common use cases
+ * Release the shared store (tests, graceful shutdown).
+ * @returns {Promise<void>}
+ */
+async function closeSharedMemoryStore() {
+  if (!sharedMemoryStore) return;
+  const store = sharedMemoryStore;
+  sharedMemoryStore = null;
+  await store.close();
+}
+
+function defaultIdentifier(req) {
+  return req.ip ?? req.socket?.remoteAddress ?? null;
+}
+
+/**
+ * Warn once if we are deriving identity from a socket address while an
+ * `X-Forwarded-For` header is present and `trust proxy` is unset: every client
+ * behind that proxy is sharing one bucket, so one busy tenant locks out the
+ * rest. The inverse (trusting the header blindly) is a bypass, so the fix is a
+ * deliberate `app.set('trust proxy', <hops>)`, not a default.
+ */
+function warnAboutProxy(req, logger, state) {
+  if (state.warnedAboutProxy) return;
+  if (!req.headers?.['x-forwarded-for']) return;
+
+  const trustProxy = typeof req.app?.get === 'function' ? req.app.get('trust proxy') : undefined;
+  if (trustProxy) return;
+
+  state.warnedAboutProxy = true;
+  logger.warn?.(
+    '[RateLimiter] X-Forwarded-For is present but "trust proxy" is not set: req.ip is the ' +
+      'proxy address, so all clients behind it share one bucket. Set app.set("trust proxy", <hops>) ' +
+      'and make sure the proxy overwrites the header, or supply a custom identifier.'
+  );
+}
+
+function applyHeaders(res, result) {
+  if (res.headersSent) return;
+
+  const remaining = Math.max(0, result.remaining);
+
+  // IETF draft names.
+  res.setHeader('RateLimit-Limit', result.limit);
+  res.setHeader('RateLimit-Remaining', remaining);
+
+  // Legacy names, kept for existing clients.
+  res.setHeader('X-RateLimit-Limit', result.limit);
+  res.setHeader('X-RateLimit-Remaining', remaining);
+
+  // `resetMs` is time until the bucket is back at capacity. Two cases must not
+  // produce a reset header: a non-finite value (`new Date(Infinity)
+  // .toISOString()` throws), and a rejection that waiting cannot resolve -
+  // advertising "resets now" for a limiter that never refills is a lie.
+  const unsatisfiable = !result.allowed && !Number.isFinite(result.retryAfterMs);
+  if (!unsatisfiable && Number.isFinite(result.resetMs)) {
+    res.setHeader('RateLimit-Reset', Math.ceil(result.resetMs / 1000));
+    res.setHeader('X-RateLimit-Reset', new Date(Date.now() + result.resetMs).toISOString());
+  }
+
+  if (!result.allowed && Number.isFinite(result.retryAfterMs)) {
+    // Never 0: a client honouring `Retry-After: 0` retries in a hot loop.
+    res.setHeader('Retry-After', Math.max(1, Math.ceil(result.retryAfterMs / 1000)));
+  }
+}
+
+/**
+ * @param {object} [options]
+ * @param {number} [options.requestsPerMinute=60] - sustained rate; 0 denies everything
+ * @param {number} [options.capacity=requestsPerMinute] - burst size
+ * @param {number} [options.cost=1] - tokens spent per request
+ * @param {string} [options.scope] - bucket namespace; defaults to a hash of the limits
+ * @param {object} [options.store] - MemoryStore (default, shared) or RedisStore
+ * @param {(req) => string|null} [options.identifier] - defaults to req.ip
+ * @param {(req) => boolean} [options.skip]
+ * @param {(req, res, next) => void} [options.handler] - custom rejection
+ * @param {boolean} [options.headers=true]
+ * @param {string} [options.message]
+ * @param {number} [options.statusCode=429]
+ * @param {object} [options.logger=console]
+ * @returns {Function} Express middleware, with .scope/.store/.metrics/.close()
+ */
+function createRateLimiter(options = {}) {
+  const requestsPerMinute = assertNumber(options.requestsPerMinute ?? 60, 'requestsPerMinute', {
+    allowZero: true
+  });
+  const capacity = assertNumber(options.capacity ?? requestsPerMinute, 'capacity', {
+    allowZero: true
+  });
+  const cost = assertNumber(options.cost ?? 1, 'cost');
+
+  if (capacity > 0 && cost > capacity) {
+    throw new RangeError(
+      `cost (${cost}) exceeds capacity (${capacity}): every request would be rejected forever`
+    );
+  }
+
+  const refillRate = requestsPerMinute / 60;
+  const usingDefaultIdentifier = options.identifier === undefined;
+
+  const config = {
+    requestsPerMinute,
+    capacity,
+    cost,
+    refillRate,
+    scope: normalizeScope(options.scope ?? scopeFor({ capacity, refillRate, cost })),
+    store: options.store ? assertStore(options.store, 'store') : getSharedMemoryStore(),
+    identifier: assertFunction(options.identifier ?? defaultIdentifier, 'identifier'),
+    skip: assertFunction(options.skip ?? (() => false), 'skip'),
+    handler: options.handler ? assertFunction(options.handler, 'handler') : null,
+    headers: options.headers !== false,
+    message: options.message ?? 'Too many requests, please try again later.',
+    statusCode: assertNumber(options.statusCode ?? 429, 'statusCode', { integer: true }),
+    logger: options.logger ?? console
+  };
+
+  const metrics = { allowed: 0, denied: 0, skipped: 0, unidentified: 0, errors: 0, degraded: 0 };
+  const state = { warnedAboutProxy: false, warnedAboutIdentifier: false };
+
+  async function rateLimiterMiddleware(req, res, next) {
+    // Nothing below may throw synchronously into Express: user-supplied
+    // callbacks, header serialisation and the store are all inside the try, and
+    // every failure is handed to the error handler instead of rejecting.
+    try {
+      if (config.skip(req)) {
+        metrics.skipped += 1;
+        return next();
+      }
+
+      const rawIdentifier = config.identifier(req);
+      if (rawIdentifier === null || rawIdentifier === undefined || rawIdentifier === '') {
+        metrics.unidentified += 1;
+        if (!state.warnedAboutIdentifier) {
+          state.warnedAboutIdentifier = true;
+          config.logger.warn?.(
+            '[RateLimiter] identifier() returned no value; requests are passing unlimited'
+          );
+        }
+        return next();
+      }
+
+      if (usingDefaultIdentifier) warnAboutProxy(req, config.logger, state);
+
+      const result = await config.store.checkLimit(normalizeIdentifier(rawIdentifier), {
+        scope: config.scope,
+        capacity: config.capacity,
+        refillRate: config.refillRate,
+        tokens: config.cost
+      });
+
+      if (result.degraded) metrics.degraded += 1;
+      if (config.headers) applyHeaders(res, result);
+
+      if (result.allowed) {
+        metrics.allowed += 1;
+        return next();
+      }
+
+      metrics.denied += 1;
+      if (config.handler) return config.handler(req, res, next);
+
+      const retryAfterSeconds = Number.isFinite(result.retryAfterMs)
+        ? Math.max(1, Math.ceil(result.retryAfterMs / 1000))
+        : null;
+
+      return res.status(config.statusCode).json({
+        error: 'Too Many Requests',
+        message: config.message,
+        // null means "not from waiting" - the limit never refills, or the
+        // request costs more than the bucket can ever hold.
+        retryAfter: retryAfterSeconds,
+        limit: result.limit,
+        remaining: Math.max(0, result.remaining)
+      });
+    } catch (err) {
+      metrics.errors += 1;
+      return next(err);
+    }
+  }
+
+  rateLimiterMiddleware.config = config;
+  rateLimiterMiddleware.scope = config.scope;
+  rateLimiterMiddleware.store = config.store;
+  rateLimiterMiddleware.metrics = metrics;
+  /** Only closes the store if this limiter owns it. */
+  rateLimiterMiddleware.close = async () => {
+    if (config.store !== sharedMemoryStore) await config.store.close?.();
+  };
+
+  return rateLimiterMiddleware;
+}
+
+/**
+ * Named configurations. `scope` is set explicitly so a preset keeps its own
+ * bucket even if another limiter happens to share its numbers.
  */
 const presets = {
-  // Strict: 10 requests per minute
-  strict: (options = {}) => createRateLimiter({
-    requestsPerMinute: 10,
-    ...options
-  }),
+  strict: (options = {}) =>
+    createRateLimiter({ requestsPerMinute: 10, scope: 'preset-strict', ...options }),
 
-  // Moderate: 60 requests per minute (default)
-  moderate: (options = {}) => createRateLimiter({
-    requestsPerMinute: 60,
-    ...options
-  }),
+  moderate: (options = {}) =>
+    createRateLimiter({ requestsPerMinute: 60, scope: 'preset-moderate', ...options }),
 
-  // Relaxed: 120 requests per minute
-  relaxed: (options = {}) => createRateLimiter({
-    requestsPerMinute: 120,
-    ...options
-  }),
+  relaxed: (options = {}) =>
+    createRateLimiter({ requestsPerMinute: 120, scope: 'preset-relaxed', ...options }),
 
-  // API: 1000 requests per minute with burst
-  api: (options = {}) => createRateLimiter({
-    requestsPerMinute: 1000,
-    capacity: 100, // Allow bursts
-    ...options
-  })
+  // 1000/min sustained, but no more than 200 back-to-back.
+  api: (options = {}) =>
+    createRateLimiter({
+      requestsPerMinute: 1000,
+      capacity: 200,
+      scope: 'preset-api',
+      ...options
+    })
 };
 
 module.exports = createRateLimiter;
 module.exports.presets = presets;
+module.exports.getSharedMemoryStore = getSharedMemoryStore;
+module.exports.closeSharedMemoryStore = closeSharedMemoryStore;

@@ -1,21 +1,42 @@
 {
   "name": "rateguard",
-  "version": "1.0.0",
-  "description": "Production-ready API rate limiter with token bucket algorithm",
-  "main": "src/demo/server.js",
+  "version": "2.0.0",
+  "description": "Distributed API rate limiter middleware for Express, using a token bucket over Redis or memory",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./memory-store": "./src/storage/memoryStore.js",
+    "./redis-store": "./src/storage/redisStore.js",
+    "./token-bucket": "./src/algorithms/tokenBucket.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
   "scripts": {
     "start": "node src/demo/server.js",
-    "dev": "nodemon src/demo/server.js",
-    "test": "node tests/tokenBucket.test.js"
+    "start:redis": "node src/demo/server-redis.js",
+    "dev": "node --watch src/demo/server.js",
+    "test": "node --test \"tests/*.test.js\"",
+    "bench": "node tests/bench.js"
   },
-  "keywords": ["rate-limiter", "middleware", "express", "token-bucket"],
-  "author": "Your Name",
+  "keywords": [
+    "rate-limiter",
+    "rate-limiting",
+    "middleware",
+    "express",
+    "token-bucket",
+    "redis",
+    "distributed"
+  ],
+  "author": "brightyorcerf <thetejaansh@gmail.com>",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "redis": "^4.6.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
+    "express": "^5.2.1",
+    "redis": "^5.10.0"
   }
 }

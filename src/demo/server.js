@@ -1,61 +1,74 @@
+'use strict';
+
 /**
- * Demo API Server
- * 
- * Shows different rate limiting configurations in action
- * Run: node src/demo/server.js
- * Test: Use browser or curl to hit endpoints
+ * Demo API server, in-memory backend.
+ *
+ *   npm start
+ *   PORT=4000 npm start
+ *
+ * Single process only. Two instances have two independent sets of buckets -
+ * use server-redis.js for anything with more than one server.
  */
 
 const express = require('express');
 const rateLimiter = require('../middleware/rateLimiter');
+const {
+  createAdminAuth,
+  createRequestLogger,
+  installShutdownHandlers,
+  secretsMatch
+} = require('./shared');
+const { normalizeIdentifier } = require('../internal/identity');
+
+const PORT = Number(process.env.PORT ?? 3000);
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
 const app = express();
-const PORT = 3000;
 
-// Middleware
-app.use(express.json());
+// If this demo ever runs behind a proxy, this is the line to change - and the
+// proxy must overwrite X-Forwarded-For rather than append to a client value.
+// app.set('trust proxy', 1);
 
-// Custom logger to see requests
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  next();
-});
-
-// ==========================================
-// DEMO ROUTES WITH DIFFERENT RATE LIMITS
-// ==========================================
+app.use(createRequestLogger({ logClientIps: process.env.LOG_CLIENT_IPS === '1' }));
 
 /**
- * Route 1: Global rate limit (60 req/min)
- * Applied to all routes below unless overridden
+ * Aggregate safety net, mounted before every route so it actually applies.
+ *
+ * It is deliberately looser than the per-route limits: a request that passes
+ * through two limiters spends a token in each, so the effective limit is the
+ * stricter of the two. A 60/min net would silently cap the 120/min endpoint.
  */
-app.use(rateLimiter({
-  requestsPerMinute: 60,
-  message: 'Global rate limit exceeded. Slow down!'
-}));
-
-/**
- * Route 2: Public endpoint - relaxed limit
- * Good for public APIs with lots of traffic
- */
-app.get('/api/public', 
-  rateLimiter.presets.relaxed(),
-  (req, res) => {
-    res.json({
-      message: 'Public endpoint - 120 requests/min allowed',
-      timestamp: new Date().toISOString()
-    });
-  }
+app.use(
+  rateLimiter({
+    requestsPerMinute: 300,
+    scope: 'global',
+    message: 'Global rate limit exceeded. Slow down!'
+  })
 );
 
+// Body parsing sits after the limiter: parsing bodies for requests we are about
+// to reject is work an attacker gets for free.
+app.use(express.json({ limit: '100kb' }));
+
 /**
- * Route 3: Strict endpoint - VERY limited
- * Perfect for expensive operations (DB writes, email sending, etc.)
+ * Relaxed public endpoint: 120 req/min.
  */
-app.get('/api/expensive',
+app.get('/api/public', rateLimiter.presets.relaxed(), (req, res) => {
+  res.json({
+    message: 'Public endpoint - 120 requests/min allowed',
+    timestamp: new Date().toISOString()
+  });
+});
+
+/**
+ * Strict endpoint for expensive work: 5 req/min, no burst above 5.
+ */
+app.get(
+  '/api/expensive',
   rateLimiter({
-    requestsPerMinute: 5, // Only 5 per minute!
+    requestsPerMinute: 5,
     capacity: 5,
+    scope: 'expensive',
     message: 'This endpoint is expensive. You can only call it 5 times per minute.'
   }),
   (req, res) => {
@@ -68,144 +81,184 @@ app.get('/api/expensive',
 );
 
 /**
- * Route 4: Custom identifier - rate limit by API key
- * Shows how to rate limit by something other than IP
+ * Rate limiting by API key.
+ *
+ * The header is client-controlled, so a fabricated key is a fresh bucket. In a
+ * real service the key must be validated against a registry before it is used
+ * as an identity; here we fall back to the IP for unknown keys so rotation
+ * cannot mint unlimited allowances.
  */
-app.get('/api/with-key',
+const KNOWN_API_KEYS = new Set(
+  (process.env.API_KEYS ?? 'demo-key-1,demo-key-2').split(',').filter(Boolean)
+);
+
+app.get(
+  '/api/with-key',
   rateLimiter({
     requestsPerMinute: 10,
+    scope: 'api-key',
     identifier: (req) => {
-      // Use API key from header, fallback to IP
-      return req.headers['x-api-key'] || req.ip;
+      const presented = req.headers['x-api-key'];
+      if (typeof presented === 'string' && KNOWN_API_KEYS.has(presented)) {
+        return `key:${presented}`;
+      }
+      return req.ip;
     },
     message: 'API key rate limit exceeded'
   }),
   (req, res) => {
-    const apiKey = req.headers['x-api-key'] || 'none';
+    const presented = req.headers['x-api-key'];
+    const recognised = typeof presented === 'string' && KNOWN_API_KEYS.has(presented);
     res.json({
       message: 'Rate limited by API key',
-      apiKey: apiKey,
-      note: '10 requests per minute per API key',
+      recognisedKey: recognised,
+      note: recognised
+        ? '10 requests per minute for this key'
+        : 'Unrecognised key - limited by IP instead',
       timestamp: new Date().toISOString()
     });
   }
 );
 
 /**
- * Route 5: Custom handler - custom 429 response
+ * Custom rejection payload: 3 login attempts per minute.
  */
-app.post('/api/login',
+app.post(
+  '/api/login',
   rateLimiter({
-    requestsPerMinute: 3, // Very strict for login attempts
+    requestsPerMinute: 3,
     capacity: 3,
+    scope: 'login',
     handler: (req, res) => {
-      // Custom response for rate limit
       res.status(429).json({
         error: 'RATE_LIMIT_EXCEEDED',
         message: 'Too many login attempts. Please wait before trying again.',
-        suggestion: 'Consider using a stronger password to avoid lockouts.',
         timestamp: new Date().toISOString()
       });
     }
   }),
   (req, res) => {
     res.json({
-      message: 'Login successful',
+      message: 'Login endpoint reached (this demo does not authenticate)',
       note: 'This endpoint allows only 3 attempts per minute'
     });
   }
 );
 
 /**
- * Route 6: Whitelisted route - no rate limit for admins
+ * Conditional bypass.
+ *
+ * The bypass exists only when ADMIN_TOKEN is set in the environment; the old
+ * hard-coded token was a documented rate limit bypass committed to the repo.
  */
-app.get('/api/admin',
+app.get(
+  '/api/admin',
   rateLimiter({
     requestsPerMinute: 10,
+    scope: 'admin',
     skip: (req) => {
-      // Skip rate limiting if admin token is present
-      return req.headers['x-admin-token'] === 'supersecret';
+      const presented = req.headers['x-admin-token'];
+      return Boolean(ADMIN_TOKEN) && typeof presented === 'string' && secretsMatch(presented, ADMIN_TOKEN);
     }
   }),
   (req, res) => {
-    const isAdmin = req.headers['x-admin-token'] === 'supersecret';
     res.json({
       message: 'Admin endpoint',
-      note: isAdmin 
-        ? 'Admin token detected - no rate limit applied' 
-        : 'Regular user - 10 requests per minute',
+      note: ADMIN_TOKEN
+        ? 'Send X-Admin-Token to bypass the limit'
+        : 'ADMIN_TOKEN is not configured, so no bypass is available',
       timestamp: new Date().toISOString()
     });
   }
 );
 
 /**
- * Route 7: Status endpoint - check your rate limit status
+ * Aggregate counters. Never returns identifiers.
  */
+const adminAuth = createAdminAuth(ADMIN_TOKEN);
+if (adminAuth) {
+  app.get('/api/admin/stats', adminAuth, async (req, res, next) => {
+    try {
+      res.json(await rateLimiter.getSharedMemoryStore().getStats());
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/reset/:identifier', adminAuth, async (req, res, next) => {
+    try {
+      const removed = await rateLimiter
+        .getSharedMemoryStore()
+        .reset(req.params.identifier, req.query.scope ? { scope: req.query.scope } : {});
+      res.json({ removed, timestamp: new Date().toISOString() });
+    } catch (err) {
+      next(err);
+    }
+  });
+}
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', backend: 'memory', uptimeSeconds: Math.floor(process.uptime()) });
+});
+
 app.get('/api/status', (req, res) => {
   res.json({
     message: 'Rate limiter is active',
-    yourIP: req.ip,
+    backend: 'memory',
+    // The normalised form, which is what the bucket is actually keyed by.
+    yourIdentity: normalizeIdentifier(req.ip ?? 'unknown'),
     endpoints: {
-      '/api/public': '120 req/min - Relaxed',
-      '/api/expensive': '5 req/min - Strict',
-      '/api/with-key': '10 req/min - API key based',
-      '/api/login': '3 req/min - Login protection',
-      '/api/admin': '10 req/min - Whitelisted for admins',
+      '/api/public': '120 req/min',
+      '/api/expensive': '5 req/min',
+      '/api/with-key': '10 req/min per recognised API key, else per IP',
+      '/api/login': '3 req/min',
+      '/api/admin': `10 req/min${ADMIN_TOKEN ? ', bypassable with X-Admin-Token' : ''}`,
+      '(all routes)': '300 req/min aggregate'
     },
-    tip: 'Check response headers for X-RateLimit-* information'
+    adminEndpointsEnabled: Boolean(adminAuth),
+    tip: 'Check the RateLimit-* response headers'
   });
 });
 
-/**
- * Root route - Instructions
- */
 app.get('/', (req, res) => {
   res.json({
-    message: 'RateGuard Demo API',
-    instructions: 'Try hitting these endpoints rapidly to see rate limiting in action!',
+    message: 'RateGuard demo (in-memory)',
     endpoints: [
-      'GET /api/status - Check rate limit info',
+      'GET /health',
+      'GET /api/status',
       'GET /api/public - 120 req/min',
-      'GET /api/expensive - 5 req/min (try this one!)',
-      'GET /api/with-key - Requires X-Api-Key header',
+      'GET /api/expensive - 5 req/min',
+      'GET /api/with-key - X-Api-Key based',
       'POST /api/login - 3 req/min',
-      'GET /api/admin - Use X-Admin-Token: supersecret to bypass'
+      'GET /api/admin - 10 req/min'
     ],
-    testCommand: 'curl http://localhost:3000/api/expensive -i',
-    loopTest: 'for i in {1..10}; do curl http://localhost:3000/api/expensive; echo ""; done'
+    testCommand: 'curl -i http://localhost:' + PORT + '/api/expensive'
   });
 });
 
-// Error handling
+// Express 5 forwards rejected async handlers here; the middleware also routes
+// its own failures through next(err) rather than rejecting.
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
+  console.error('[Server] unhandled error:', err);
+  if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════╗
-║      RateGuard Demo Server v1.0        ║
-╚════════════════════════════════════════╝
+function start() {
+  const server = app.listen(PORT, () => {
+    console.log(`[Server] RateGuard demo (in-memory) listening on http://localhost:${PORT}`);
+    if (!ADMIN_TOKEN) {
+      console.log('[Server] ADMIN_TOKEN not set: admin endpoints and the bypass are disabled');
+    }
+  });
 
-Server running on http://localhost:${PORT}
+  installShutdownHandlers(server, {
+    onShutdown: () => rateLimiter.closeSharedMemoryStore()
+  });
 
-Try these commands:
-  
-  1. Check status:
-     curl http://localhost:${PORT}/api/status
+  return server;
+}
 
-  2. Test strict rate limit (5 req/min):
-     for i in {1..10}; do curl http://localhost:${PORT}/api/expensive; echo ""; sleep 0.5; done
+if (require.main === module) start();
 
-  3. View rate limit headers:
-     curl -i http://localhost:${PORT}/api/expensive
-
-  4. Test with API key:
-     curl -H "X-Api-Key: mykey123" http://localhost:${PORT}/api/with-key
-
-Press Ctrl+C to stop
-  `);
-}); 
+module.exports = { app, start };

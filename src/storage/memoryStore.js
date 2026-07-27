@@ -1,118 +1,239 @@
-/**
- * memory Store for Rate Limiter
- * 
- * stores TokenBucket instances for each client  
- * this is the in-memory version, great for single-server deployments
- * 
- * in production with multiple servers, we'ld use Redis instead
- */
+'use strict';
 
 const TokenBucket = require('../algorithms/tokenBucket');
+const { assertNumber, assertFunction } = require('../internal/validate');
+const { normalizeIdentifier, normalizeScope, hashIdentifier } = require('../internal/identity');
 
-class MemoryStore{
-  constructor(){ 
+/**
+ * In-process store. Correct for a single server; use RedisStore for more.
+ *
+ * Implements the store contract shared with RedisStore:
+ *
+ *   checkLimit(identifier, { scope, capacity, refillRate, tokens }) =>
+ *     { allowed, limit, remaining, retryAfterMs, resetMs, degraded }
+ *
+ *   retryAfterMs: 0 when allowed, Infinity when unsatisfiable
+ *   resetMs:      ms until the bucket is back at capacity (0 when full)
+ *
+ * Buckets are keyed by `scope|identifier`: two limiters with different limits
+ * must never share a bucket, or the stricter limit is silently widened.
+ */
+class MemoryStore {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxClients=100000] - hard bound on tracked clients (LRU eviction)
+   * @param {number} [options.cleanupIntervalMs=600000] - sweep period
+   * @param {number} [options.inactiveAfterMs=3600000] - idle age at which a bucket is dropped
+   * @param {boolean} [options.autoCleanup=true]
+   * @param {() => number} [options.now] - injectable clock, for tests
+   */
+  constructor(options = {}) {
+    this.maxClients = assertNumber(options.maxClients ?? 100_000, 'maxClients', { integer: true });
+    this.cleanupIntervalMs = assertNumber(
+      options.cleanupIntervalMs ?? 10 * 60 * 1000,
+      'cleanupIntervalMs'
+    );
+    this.inactiveAfterMs = assertNumber(
+      options.inactiveAfterMs ?? 60 * 60 * 1000,
+      'inactiveAfterMs'
+    );
+    this.now = options.now ? assertFunction(options.now, 'options.now') : Date.now;
+
+    /** @type {Map<string, TokenBucket>} insertion order doubles as LRU order */
     this.buckets = new Map();
-    this.startCleanup();
+    this.cleanupInterval = null;
+    this.metrics = { allowed: 0, denied: 0, evicted: 0, swept: 0 };
+
+    if (options.autoCleanup !== false) this.startCleanup();
   }
 
   /**
-   * get or create a bucket for a client
-   * @param {string} identifier - client identifier  
-   * @param {number} capacity - bucket capacity
-   * @param {number} refillRate - tokens/s
-   * @returns {TokenBucket} - the bucket for this client
+   * @param {string} scope
+   * @param {string} identifier
+   * @returns {string} `scope` is validated to exclude `|`, so the first
+   *   separator is unambiguous even when the identifier contains one.
    */
-  getBucket(identifier, capacity, refillRate) { 
-    if (this.buckets.has(identifier)) {
-      return this.buckets.get(identifier);
+  getKey(scope, identifier) {
+    return `${scope}|${identifier}`;
+  }
+
+  /**
+   * Fetch or create a bucket, reconciling configuration drift.
+   *
+   * A bucket created under one configuration must not keep serving another:
+   * that is how `X-RateLimit-Limit` ends up advertising 100 for a bucket that
+   * physically holds 5.
+   */
+  getBucket(key, capacity, refillRate) {
+    const existing = this.buckets.get(key);
+    if (existing) {
+      // Touch for LRU ordering.
+      this.buckets.delete(key);
+      this.buckets.set(key, existing);
+      existing.reconfigure(capacity, refillRate);
+      return existing;
     }
-    const bucket = new TokenBucket(capacity, refillRate);
-    this.buckets.set(identifier, bucket);
-    
+
+    const bucket = new TokenBucket(capacity, refillRate, { now: this.now });
+    this.buckets.set(key, bucket);
+    this.evictIfNeeded();
     return bucket;
   }
 
   /**
-   * Check if request is allowed and consume token if it is
-   * @param {string} identifier - Client identifier
-   * @param {object} options - Rate limit configuration
-   * @returns {object} - { allowed: boolean, retryAfter: number, remaining: number }
+   * Drop least-recently-used buckets past the bound.
+   *
+   * Without this, an attacker rotating an attacker-controlled identifier (an
+   * API key header, an IPv6 address from a /64) grows the map without limit.
+   * Evicting a bucket only ever grants its owner a fresh allowance, so the
+   * bound trades a little enforcement fidelity for a hard memory ceiling.
    */
-  checkLimit(identifier, options) {
-    const { capacity, refillRate, tokens = 1 } = options;
-    
-    // Get or create bucket for this client
-    const bucket = this.getBucket(identifier, capacity, refillRate);
-    
-    // Try to consume tokens
+  evictIfNeeded() {
+    while (this.buckets.size > this.maxClients) {
+      const oldest = this.buckets.keys().next();
+      if (oldest.done) break;
+      this.buckets.delete(oldest.value);
+      this.metrics.evicted += 1;
+    }
+  }
+
+  /**
+   * @param {string} identifier
+   * @param {{scope: string, capacity: number, refillRate: number, tokens?: number}} options
+   * @returns {Promise<object>} see the contract in the class comment
+   */
+  async checkLimit(identifier, options = {}) {
+    const scope = normalizeScope(options.scope ?? 'default');
+    const capacity = assertNumber(options.capacity, 'capacity', { allowZero: true });
+    const refillRate = assertNumber(options.refillRate, 'refillRate', { allowZero: true });
+    const tokens = assertNumber(options.tokens ?? 1, 'tokens');
+
+    const key = this.getKey(scope, normalizeIdentifier(identifier));
+    const bucket = this.getBucket(key, capacity, refillRate);
+
     const allowed = bucket.consume(tokens);
-    
-    // Get current state for response headers
-    const state = bucket.getState();
-    
+    if (allowed) this.metrics.allowed += 1;
+    else this.metrics.denied += 1;
+
     return {
       allowed,
-      remaining: Math.floor(state.tokens),
-      retryAfter: allowed ? 0 : bucket.getRetryAfter(tokens),
-      limit: capacity,
-      resetTime: Date.now() + (state.timeUntilRefill || 0)
+      limit: bucket.capacity,
+      remaining: Math.floor(bucket.tokens),
+      retryAfterMs: allowed ? 0 : bucket.getRetryAfter(tokens),
+      resetMs: bucket.getResetMs(),
+      degraded: false
     };
   }
 
   /**
-   * Reset a specific client's bucket (useful for testing or admin actions)
-   * @param {string} identifier - Client identifier
+   * @param {string} identifier
+   * @param {{scope?: string}} [options] - omit to clear the identifier in every scope
+   * @returns {Promise<number>} buckets removed
    */
-  reset(identifier) {
-    this.buckets.delete(identifier);
-  }
+  async reset(identifier, options = {}) {
+    const id = normalizeIdentifier(identifier);
 
-  /**
-   * Reset all buckets (useful for testing)
-   */
-  resetAll() {
-    this.buckets.clear();
-  }
+    if (options.scope !== undefined) {
+      return this.buckets.delete(this.getKey(normalizeScope(options.scope), id)) ? 1 : 0;
+    }
 
-  /**
-   * Get current stats (useful for monitoring/debugging)
-   * @returns {object} - Store statistics
-   */
-  getStats() {
-    return {
-      totalClients: this.buckets.size,
-      clients: Array.from(this.buckets.keys())
-    };
-  }
-
-  /**
-   * Cleanup inactive buckets to prevent memory leaks
-   * Runs every 10 minutes by default
-   */
-  startCleanup(intervalMs = 10 * 60 * 1000) {
-    this.cleanupInterval = setInterval(() => {
-      const now = Date.now();
-      const inactiveThreshold = 60 * 60 * 1000; // 1 hour
-      
-      for (const [identifier, bucket] of this.buckets.entries()) {
-        // If bucket hasn't been accessed in over an hour, remove it
-        const timeSinceLastUse = now - bucket.lastRefill;
-        if (timeSinceLastUse > inactiveThreshold) {
-          this.buckets.delete(identifier);
-        }
+    let removed = 0;
+    const suffix = `|${id}`;
+    for (const key of this.buckets.keys()) {
+      if (key.endsWith(suffix)) {
+        this.buckets.delete(key);
+        removed += 1;
       }
-      
-      console.log(`[MemoryStore] Cleanup: ${this.buckets.size} active clients`);
-    }, intervalMs);
+    }
+    return removed;
   }
 
   /**
-   * Stop cleanup interval (useful for testing and graceful shutdown)
+   * @returns {Promise<number>} buckets removed
    */
+  async resetAll() {
+    const removed = this.buckets.size;
+    this.buckets.clear();
+    return removed;
+  }
+
+  /**
+   * Counts and per-scope cardinality only.
+   *
+   * Identifiers are credentials in the API-key configuration the README
+   * documents, so they are never returned by default; when explicitly
+   * requested they are hashed.
+   *
+   * @param {{includeIdentifiers?: boolean, sampleLimit?: number}} [options]
+   */
+  async getStats(options = {}) {
+    const byScope = {};
+    const sample = [];
+
+    for (const key of this.buckets.keys()) {
+      const scope = key.slice(0, key.indexOf('|'));
+      byScope[scope] = (byScope[scope] ?? 0) + 1;
+      if (options.includeIdentifiers && sample.length < (options.sampleLimit ?? 100)) {
+        sample.push({ scope, identifierHash: hashIdentifier(key.slice(key.indexOf('|') + 1)) });
+      }
+    }
+
+    const stats = {
+      backend: 'memory',
+      totalClients: this.buckets.size,
+      maxClients: this.maxClients,
+      byScope,
+      metrics: { ...this.metrics }
+    };
+    if (options.includeIdentifiers) stats.sampledClients = sample;
+    return stats;
+  }
+
+  /**
+   * Drop buckets idle longer than `inactiveAfterMs`.
+   *
+   * The timer is unref'd: a rate limiter must never be the reason a process
+   * refuses to exit (six middleware instances used to mean six live timers).
+   */
+  startCleanup(intervalMs = this.cleanupIntervalMs) {
+    if (this.cleanupInterval) return this.cleanupInterval;
+
+    this.cleanupInterval = setInterval(() => this.sweep(), intervalMs);
+    if (typeof this.cleanupInterval.unref === 'function') this.cleanupInterval.unref();
+    return this.cleanupInterval;
+  }
+
+  /**
+   * @returns {number} buckets removed
+   */
+  sweep() {
+    const now = this.now();
+    let removed = 0;
+
+    for (const [key, bucket] of this.buckets) {
+      if (now - bucket.lastRefill > this.inactiveAfterMs) {
+        this.buckets.delete(key);
+        removed += 1;
+      }
+    }
+    this.metrics.swept += removed;
+    return removed;
+  }
+
   stopCleanup() {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
     }
+  }
+
+  /**
+   * Symmetry with RedisStore.close(), so callers can shut down either backend
+   * without knowing which one they hold.
+   */
+  async close() {
+    this.stopCleanup();
+    this.buckets.clear();
   }
 }
 
