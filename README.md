@@ -2,8 +2,6 @@
 
 Distributed rate limiting for Express, using a token bucket over Redis or memory.
 
-![image](image.jpg)
-
 ---
 
 ## Tech Stack
@@ -103,6 +101,29 @@ Without the scope, every limiter sharing a store shares a bucket, and then a 5 r
 ```
 
 Every server pointed at the same Redis shares one bucket per (scope, identifier), and Redis supplies the clock, so limits hold across the fleet rather than per process.
+
+### Redis Cluster
+
+Pass `rootNodes` instead of `host`/`port`/`url` and `RedisStore` switches to `redis.createCluster`:
+
+```javascript
+const store = new RedisStore({
+  rootNodes: [
+    { url: 'redis://10.0.0.1:6379' },
+    { url: 'redis://10.0.0.2:6379' },
+    { url: 'redis://10.0.0.3:6379' }
+  ]
+});
+```
+
+`checkLimit` itself is slot-safe for free: every call touches exactly one key, so the cluster client routes it to the right shard with no extra work. Everything else on a cluster touches every shard and had to be built explicitly, because none of it is a native cluster-wide operation:
+
+- **Script loading** fans out `SCRIPT LOAD` to every master individually. A cluster client only loads the script onto the node it happens to route to; the others would answer `EVALSHA` with `NOSCRIPT` the first time they saw a key. A `NOSCRIPT` response triggers a reload on just that node.
+- **`getStats()` and `resetAll()`** scan every master separately and merge the results. `SCAN`'s cursor is only meaningful to the node that issued it - there is no such thing as a cluster-wide scan.
+- **Multi-key `DEL`** (clearing every scope for one identifier) is done key-by-key with bounded concurrency instead of one batched command, because the keys can land on different masters and a cross-shard `DEL` fails outright with `CROSSSLOT`.
+- **A single master going down degrades only the slots it owns.** Cluster errors are counted and logged but never flip the store's overall readiness the way a single-node disconnect does - the other two-thirds of your keyspace keeps enforcing normally.
+
+Covered by `tests/redisCluster.test.js` (9 tests) against a live 3-node cluster; see [Testing](#testing) for how to point the suite at one.
 
 ---
 
@@ -258,8 +279,9 @@ Invalid configuration throws at wire-up rather than misbehaving per request: `Na
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `url` / `host` / `port` | `127.0.0.1:6379` | `url` wins when both are given. |
-| `username` / `password` / `db` | - | Passed through to node-redis. |
+| `url` / `host` / `port` | `127.0.0.1:6379` | `url` wins when both are given. Ignored in cluster mode. |
+| `rootNodes` | unset | Array of `{ url }` or `{ host, port }`. Presence switches to Redis Cluster mode (`redis.createCluster`); see [Redis Cluster](#redis-cluster). |
+| `username` / `password` / `db` | - | Passed through to node-redis. `db` is not supported in cluster mode (Redis Cluster is always db 0). |
 | `socket` | `{}` | Merged into the socket options (TLS, etc.). |
 | `keyPrefix` | `ratelimit:` | Key namespace. |
 | `failOpen` | `true` | Allow (`true`) or reject (`false`) when Redis is unusable. |
@@ -323,12 +345,13 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 ## Testing
 
 ```bash
-npm test                                              # unit + integration
-TEST_REDIS_URL=redis://127.0.0.1:6379 npm test        # includes the Redis suite
-npm run bench                                         # latency harness
+npm test                                                                          # unit + integration
+TEST_REDIS_URL=redis://127.0.0.1:6379 npm test                                    # + the Redis suite
+TEST_REDIS_CLUSTER_NODES=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 npm test    # + the cluster suite
+npm run bench                                                                      # latency harness
 ```
 
-45 tests over the bucket arithmetic, both storage backends, and the middleware. The Redis-backed tests skip themselves when no Redis is reachable rather than failing. Covered explicitly, because each one was once broken:
+54 tests over the bucket arithmetic, both storage backends, and the middleware. The Redis- and cluster-backed tests skip themselves when their target isn't reachable rather than failing. Covered explicitly, because each one was once broken:
 
 - exhausting a strict endpoint must not affect a relaxed one
 - rotating an unrecognised API key must not mint quota
@@ -338,6 +361,8 @@ npm run bench                                         # latency harness
 - waiting exactly `Retry-After` must be enough to succeed
 - a clock moving backwards must neither mint nor destroy tokens
 - stats must never return identifiers in the clear
+- on a cluster, a downed master must only degrade the slots it owns
+- on a cluster, `EVALSHA` must not `NOSCRIPT` on a master the client didn't happen to route to first
 
 [tests/tests.txt](tests/tests.txt) is the manual curl runbook, including the multi-server checks.
 
